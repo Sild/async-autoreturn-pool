@@ -3,6 +3,15 @@
 
 ## [Unreleased]
 
+## [0.2.2](https://github.com/Sild/autoreturn-pool/compare/autoreturn-pool-v0.2.1...autoreturn-pool-v0.2.2) - 2024-09-27
+
+### Other
+
+- refactor dependencies
+- cargo fmt
+- add benches
+- remove unused dependencies
+
 ## [0.2.1](https://github.com/Sild/autoreturn-pool/compare/autoreturn-pool-v0.2.0...autoreturn-pool-v0.2.1) - 2024-09-27
 
 ### Other
