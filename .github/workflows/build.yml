@@ -20,3 +20,14 @@ jobs:
     - run: cargo build --all-features --verbose
     - run: cargo test --all
     - run: cargo test --all --all-features
+
+  msrv:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ["--no-default-features", "--all-features"]
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@1.85.0
+    # Dev targets use current stable; verify the consumer library graph here.
+    - run: cargo check -p auto_pool --lib ${{ matrix.features }}

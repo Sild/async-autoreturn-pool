@@ -8,6 +8,7 @@ async fn main() -> anyhow::Result<()> {
     single_thread()?;
     multi_thread()?;
     add_release()?;
+    #[cfg(feature = "async")]
     add_release_async().await?;
     Ok(())
 }
@@ -92,6 +93,7 @@ fn add_release() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "async")]
 async fn add_release_async() -> anyhow::Result<()> {
     let objects = [MyObject { value: 1 }];
     let pool = AutoPool::new(objects);

@@ -3,90 +3,121 @@ use crate::config::{AutoPoolConfig, PickStrategy};
 use parking_lot::lock_api::{MutexGuard, RawMutex};
 use parking_lot::{Condvar, Mutex};
 use rand::Rng;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// A pool of objects.
-/// After an object is taken from the pool, it is returned to the pool when it is dropped.
-/// Pool items must be passed on creation or added later:
-/// # Examples
-/// Basic usage:
-/// ```
-/// async fn test() {
-///     use auto_pool::pool::AutoPool;
-///     let pool = AutoPool::new([1, 2]);
-///     let object1 = pool.get();
-///     let object2 = pool.get_async().await;
-///     pool.add(3);
-///     let inner1 = object1.unwrap().release(); // won't be returned back
-/// }
-/// ```
+/// A pool of caller-supplied objects, returned automatically when wrappers drop.
 ///
-/// Create with custom config:
-/// ```
-///     let config = auto_pool::config::AutoPoolConfig {
-///         wait_duration: std::time::Duration::from_millis(5),
-///         ..Default::default()
-///     };
-///     let pool = auto_pool::pool::AutoPool::new_with_config(config, [1, 2]);
-///     let item = pool.get();
-/// ```
+/// See the [crate documentation](crate) for synchronous and asynchronous examples.
+/// Checked-out objects borrow this pool; no replacement objects are allocated.
 pub struct AutoPool<T: Send> {
     config: AutoPoolConfig,
     storage: Mutex<Vec<T>>,
     condvar: Condvar,
+    #[cfg(feature = "async")]
+    available: event_listener::Event,
 }
 
 impl<T: Send + 'static> AutoPool<T> {
+    /// Create a pool with unlimited waiting and LIFO selection.
     pub fn new(items: impl IntoIterator<Item = T>) -> Self { Self::new_with_config(AutoPoolConfig::default(), items) }
 
+    /// Create a pool with the supplied checkout policy and initial objects.
     pub fn new_with_config(config: AutoPoolConfig, items: impl IntoIterator<Item = T>) -> Self {
         let objects = items.into_iter().collect();
         Self {
             config,
             storage: Mutex::new(objects),
             condvar: Condvar::new(),
+            #[cfg(feature = "async")]
+            available: event_listener::Event::new(),
         }
     }
 
-    /// Take an object from the pool.
+    /// Take an object, returning `None` when the configured overall budget expires.
+    /// Zero tries immediately. Unlimited waits can block forever on an empty pool.
+    /// Scheduling and mutex reacquisition may delay completion past the deadline.
     pub fn get(&'_ self) -> Option<PoolObject<'_, T>> { self.get_with_timeout(self.config.wait_duration) }
 
-    /// Async version - tries to get object, sleep if fails until timeout
+    /// Wait asynchronously for an object, using the configured overall timeout.
+    ///
+    /// Exhaustion suspends the future without blocking a thread. The storage mutex
+    /// is held briefly for checkout; no mutex guard is held across an await.
+    /// Dropping a pending future cancels its wait without removing an object.
+    /// This works on any executor; finite timeouts use smol's timer.
     #[cfg(feature = "async")]
     pub async fn get_async(&'_ self) -> Option<PoolObject<'_, T>> {
         if self.config.wait_duration.is_zero() {
             return self.get();
         }
-
-        let start_time = std::time::Instant::now();
-        while std::time::Instant::now() - start_time < self.config.wait_duration {
-            if let Some(obj) = self.get_with_timeout(self.config.lock_duration) {
-                return Some(obj);
+        let deadline = Instant::now().checked_add(self.config.wait_duration);
+        loop {
+            // Available items need neither a listener allocation nor a timer.
+            if let Some(object) = self.extract_object(self.storage.lock()) {
+                return Some(object);
             }
-            smol::Timer::after(self.config.sleep_duration).await;
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                return None;
+            }
+
+            // Register before rechecking so a concurrent return cannot be missed.
+            let listener = self.available.listen();
+            if let Some(object) = self.extract_object(self.storage.lock()) {
+                return Some(object);
+            }
+            if let Some(deadline) = deadline {
+                let notified = smol::future::race(
+                    async {
+                        listener.await;
+                        true
+                    },
+                    async {
+                        smol::Timer::at(deadline).await;
+                        false
+                    },
+                )
+                .await;
+                if !notified {
+                    return None;
+                }
+            } else {
+                listener.await;
+            }
         }
-        None
     }
 
-    /// Is used to return item back
-    /// Also allows to add new item to the pool
+    /// Add or return an object and wake waiting consumers.
     pub fn add(&self, item: T) {
         self.storage.lock().push(item);
         self.condvar.notify_one();
+        #[cfg(feature = "async")]
+        // Separate returns must wake separate waiters. A cancelled notified
+        // listener forwards its notification to another listener on drop.
+        self.available.notify_additional(1);
     }
 
-    /// Get the number of available items
+    /// Return the number of available objects, excluding checked-out objects.
     pub fn size(&self) -> usize { self.storage.lock().len() }
 
-    /// Shrink the pool to fit current number of items
+    /// Shrink storage to the number of currently available objects.
+    /// This holds the storage mutex while reallocating.
     pub fn shrink_to_fit(&self) { self.storage.lock().shrink_to_fit(); }
 
     fn get_with_timeout(&'_ self, timeout: Duration) -> Option<PoolObject<'_, T>> {
-        let mut locked_storage = self.storage.lock();
+        let deadline = Instant::now().checked_add(timeout);
+        let mut locked_storage = if timeout.is_zero() {
+            self.storage.try_lock()?
+        } else if let Some(deadline) = deadline {
+            self.storage.try_lock_until(deadline)?
+        } else {
+            self.storage.lock()
+        };
         while locked_storage.is_empty() {
-            let wait_res = self.condvar.wait_for(&mut locked_storage, timeout);
-            if wait_res.timed_out() {
-                return None;
+            if let Some(deadline) = deadline {
+                if Instant::now() >= deadline || self.condvar.wait_until(&mut locked_storage, deadline).timed_out() {
+                    return None;
+                }
+            } else {
+                self.condvar.wait(&mut locked_storage);
             }
         }
         self.extract_object(locked_storage)
@@ -103,11 +134,63 @@ impl<T: Send + 'static> AutoPool<T> {
                 1 => locked_storage.pop(),
                 items_cnt => {
                     let index = rand::rng().next_u64() as usize % items_cnt;
-                    locked_storage.swap(index, items_cnt - 1);
-                    locked_storage.pop()
+                    Some(locked_storage.swap_remove(index))
                 }
             },
         };
         inner.map(|inner| PoolObject::new(inner, self))
+    }
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn test_notifications_do_not_restart_sync_budget() {
+        let pool = AutoPool::<u8>::new_with_config(
+            AutoPoolConfig {
+                wait_duration: Duration::from_millis(40),
+                ..Default::default()
+            },
+            [],
+        );
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..25 {
+                    std::thread::sleep(Duration::from_millis(10));
+                    pool.condvar.notify_all();
+                }
+            });
+            let start = Instant::now();
+            assert!(pool.get().is_none());
+            assert!(start.elapsed() >= Duration::from_millis(40));
+            assert!(start.elapsed() < Duration::from_millis(200));
+        });
+    }
+
+    #[test]
+    fn test_sync_budget_includes_mutex_acquisition() {
+        let pool = AutoPool::<u8>::new_with_config(
+            AutoPoolConfig {
+                wait_duration: Duration::from_millis(20),
+                ..Default::default()
+            },
+            [1],
+        );
+        std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let pool = &pool;
+            scope.spawn(move || {
+                let _guard = pool.storage.lock();
+                tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(200));
+            });
+            rx.recv().unwrap();
+            let start = Instant::now();
+            assert!(pool.get().is_none());
+            assert!(start.elapsed() < Duration::from_millis(100));
+        });
     }
 }

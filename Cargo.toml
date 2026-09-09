@@ -10,7 +10,7 @@ edition = "2021"
 authors = ["Sild <silddev@icloud.com"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/sild/libs_rs"
-rust-version = "1.81"
+rust-version = "1.85"
 publish = false
 
 [profile.bench]

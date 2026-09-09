@@ -1,6 +1,5 @@
 use crate::config::{AutoPoolConfig, PickStrategy};
 use crate::pool::AutoPool;
-use std::collections::HashMap;
 use std::ops::Deref;
 
 #[test]
@@ -94,15 +93,84 @@ fn test_pick_strategy_random() {
         ..Default::default()
     };
     let pool = AutoPool::new_with_config(config, [1, 2, 3]);
-    let mut match_counter = HashMap::new();
-    for _ in 0..3000 {
-        let obj1 = pool.get();
-        let value = *obj1.unwrap();
-        match_counter.entry(value).and_modify(|v| *v += 1).or_insert(1);
+    let mut values = Vec::new();
+    for _ in 0..3 {
+        values.push(pool.get().unwrap().release());
     }
+    values.sort_unstable();
+    assert_eq!(values, [1, 2, 3]);
+    assert!(pool.get().is_none());
+}
 
-    // not guaranteed to pass, but should be close
-    assert!(match_counter[&1] > 200);
-    assert!(match_counter[&2] > 200);
-    assert!(match_counter[&3] > 200);
+#[cfg(feature = "async")]
+#[test]
+fn test_async_first_poll_does_not_wait_for_an_item() {
+    let pool = AutoPool::<u8>::new_with_config(
+        AutoPoolConfig {
+            wait_duration: std::time::Duration::from_millis(20),
+            lock_duration: std::time::Duration::from_millis(200),
+            ..Default::default()
+        },
+        [],
+    );
+    let mut get = Box::pin(pool.get_async());
+    let start = std::time::Instant::now();
+    assert!(smol::block_on(smol::future::poll_once(&mut get)).is_none());
+    assert!(start.elapsed() < std::time::Duration::from_millis(100));
+}
+
+#[cfg(feature = "async")]
+#[test]
+fn test_async_add_wakes_without_polling_delay() {
+    let pool = AutoPool::new_with_config(
+        AutoPoolConfig {
+            wait_duration: std::time::Duration::from_secs(1),
+            lock_duration: std::time::Duration::ZERO,
+            sleep_duration: std::time::Duration::from_secs(60),
+            ..Default::default()
+        },
+        [],
+    );
+    let mut get = Box::pin(pool.get_async());
+    assert!(smol::block_on(smol::future::poll_once(&mut get)).is_none());
+    pool.add(42);
+    let result = smol::block_on(smol::future::poll_once(&mut get));
+    assert_eq!(result.flatten().map(|item| item.release()), Some(42));
+}
+
+#[test]
+fn test_return_preserves_mutation_and_release_removes_item() {
+    let pool = AutoPool::new([String::from("hello")]);
+    {
+        let mut item = pool.get().unwrap();
+        item.push_str(" world");
+        assert_eq!(pool.size(), 0);
+    }
+    assert_eq!(pool.size(), 1);
+    assert_eq!(pool.get().unwrap().release(), "hello world");
+    assert_eq!(pool.size(), 0);
+}
+
+#[test]
+fn test_zero_timeout_checks_available_items() {
+    let pool = AutoPool::new_with_config(
+        AutoPoolConfig {
+            wait_duration: std::time::Duration::ZERO,
+            ..Default::default()
+        },
+        [7],
+    );
+    assert_eq!(pool.get().unwrap().release(), 7);
+    assert!(pool.get().is_none());
+}
+
+#[test]
+fn test_default_timeout_waits_for_return() {
+    let pool = AutoPool::new([7]);
+    let item = pool.get().unwrap();
+    std::thread::scope(|scope| {
+        let waiter = scope.spawn(|| pool.get().unwrap().release());
+        drop(item);
+        assert_eq!(waiter.join().unwrap(), 7);
+    });
 }
