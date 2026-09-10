@@ -1,78 +1,166 @@
+use auto_pool::config::{AutoPoolConfig, PickStrategy};
 use auto_pool::pool::AutoPool;
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use std::sync::Arc;
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use parking_lot::Mutex;
+use std::hint::black_box;
+use std::sync::Barrier;
+use std::time::{Duration, Instant};
 
-struct DummyObject {
-    id: usize,
-    value: usize,
+const WORKERS: usize = 4;
+const BATCH: u64 = 100;
+const BUFFER_SIZE: usize = 1024;
+
+fn buffer() -> Vec<u8> { vec![0; BUFFER_SIZE] }
+
+fn touch(buffer: &mut [u8]) {
+    buffer[0] = buffer[0].wrapping_add(1);
+    black_box(buffer);
 }
 
-const POOL_SIZE: usize = 1000;
-const OPERATIONS_PER_THREAD: usize = 100;
-const THREADS_COUNT: usize = 64;
-
-fn run_tests<P: Send + Sync + 'static>(arc_pool: Arc<P>, pool_op: fn(&P)) {
-    let threads: Vec<_> = (0..THREADS_COUNT)
-        .map(|_| {
-            let pool = arc_pool.clone();
-            std::thread::spawn(move || {
-                for _ in 0..OPERATIONS_PER_THREAD {
-                    pool_op(&pool);
-                }
+// Thread startup and joining are excluded from the returned duration. The start
+// and finish barriers are measured once per sample, amortized over all rounds.
+fn parallel_rounds(rounds: u64, operation: impl Fn() + Sync) -> Duration {
+    let ready = Barrier::new(WORKERS + 1);
+    let start = Barrier::new(WORKERS + 1);
+    let finish = Barrier::new(WORKERS + 1);
+    std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..WORKERS)
+            .map(|_| {
+                let (ready, start, finish, operation) = (&ready, &start, &finish, &operation);
+                scope.spawn(move || {
+                    ready.wait();
+                    start.wait();
+                    for _ in 0..rounds {
+                        for _ in 0..BATCH {
+                            operation();
+                        }
+                    }
+                    finish.wait();
+                })
             })
-        })
-        .collect();
-    for thread in threads {
-        thread.join().unwrap();
-    }
-}
-
-fn perf_auto_pool(pool: Arc<AutoPool<DummyObject>>) {
-    run_tests(pool, |pool| {
-        let obj = pool.get().unwrap();
-        let _id = &obj.id;
-        let _val = &obj.value;
-    });
-}
-
-fn perf_lockfree_pool(pool: Arc<lockfree_object_pool::LinearObjectPool<DummyObject>>) {
-    run_tests(pool, |pool| {
-        let obj = pool.pull();
-        let _id = &obj.id;
-        let _val = &obj.value;
-    });
-}
-
-fn perf_object_pool(pool: Arc<object_pool::Pool<DummyObject>>) {
-    run_tests(pool, |pool| {
-        let obj = pool.pull(|| DummyObject { id: 0, value: 1 });
-        let _id = &obj.id;
-        let _val = &obj.value;
-    });
-}
-
-fn benchmark_functions(c: &mut Criterion) {
-    let auto_pool = Arc::new(AutoPool::new((0..POOL_SIZE).map(|id| DummyObject { id, value: 1 })));
-    c.bench_function("auto_pool", |b| b.iter(|| perf_auto_pool(black_box(auto_pool.clone()))));
-
-    // Nice interface...
-    let lockfree_pool = {
-        let pool = lockfree_object_pool::LinearObjectPool::new(|| DummyObject { id: 0, value: 1 }, |_| {});
-        {
-            let mut items = Vec::with_capacity(POOL_SIZE);
-            for _ in 0..POOL_SIZE {
-                items.push(pool.pull());
-            }
+            .collect();
+        ready.wait();
+        let before = Instant::now();
+        start.wait();
+        finish.wait();
+        let elapsed = before.elapsed();
+        for worker in workers {
+            worker.join().unwrap();
         }
-        pool
-    };
-    let lockfree_pool = Arc::new(lockfree_pool);
-    c.bench_function("lockfree_pool", |b| b.iter(|| perf_lockfree_pool(black_box(lockfree_pool.clone()))));
-
-    let object_pool = object_pool::Pool::new(POOL_SIZE, || DummyObject { id: 0, value: 1 });
-    let object_pool = Arc::new(object_pool);
-    c.bench_function("object_pool", |b| b.iter(|| perf_object_pool(black_box(object_pool.clone()))));
+        elapsed
+    })
 }
 
-criterion_group!(benches, benchmark_functions);
+fn uncontended(c: &mut Criterion) {
+    let mut group = c.benchmark_group("uncontended");
+    for (name, strategy) in [("lifo", PickStrategy::LIFO), ("random", PickStrategy::RANDOM)] {
+        let pool = AutoPool::new_with_config(
+            AutoPoolConfig {
+                pick_strategy: strategy,
+                ..Default::default()
+            },
+            (0..64).map(|_| buffer()),
+        );
+        group.bench_function(name, |b| b.iter(|| touch(&mut pool.get().unwrap())));
+    }
+    let stack = Mutex::new((0..64).map(|_| buffer()).collect::<Vec<_>>());
+    group.bench_function("mutex_stack", |b| {
+        b.iter(|| {
+            let mut item = stack.lock().pop().unwrap();
+            touch(&mut item);
+            stack.lock().push(item);
+        });
+    });
+    group.bench_function("allocate_1k", |b| b.iter(|| touch(&mut black_box(buffer()))));
+    group.finish();
+}
+
+fn contention(c: &mut Criterion) {
+    let mut group = c.benchmark_group("contention");
+    group.throughput(Throughput::Elements(WORKERS as u64 * BATCH));
+    for size in [1, WORKERS] {
+        let pool = AutoPool::new((0..size).map(|_| buffer()));
+        group.bench_with_input(BenchmarkId::new("auto_pool", size), &size, |b, _| {
+            b.iter_custom(|rounds| parallel_rounds(rounds, || touch(&mut pool.get().unwrap())));
+        });
+    }
+    // Enough items for every worker; this baseline has no exhaustion policy.
+    let stack = Mutex::new((0..WORKERS).map(|_| buffer()).collect::<Vec<_>>());
+    group.bench_function("mutex_stack_4", |b| {
+        b.iter_custom(|rounds| {
+            parallel_rounds(rounds, || {
+                let mut item = stack.lock().pop().unwrap();
+                touch(&mut item);
+                stack.lock().push(item);
+            })
+        });
+    });
+    group.bench_function("allocate_1k", |b| {
+        b.iter_custom(|rounds| parallel_rounds(rounds, || touch(&mut black_box(buffer()))));
+    });
+    group.finish();
+}
+
+fn exhaustion(c: &mut Criterion) {
+    let pool = AutoPool::<Vec<u8>>::new_with_config(
+        AutoPoolConfig {
+            wait_duration: Duration::ZERO,
+            ..Default::default()
+        },
+        [],
+    );
+    c.bench_function("exhaustion/try_empty", |b| b.iter(|| assert!(black_box(pool.get()).is_none())));
+    let pool = AutoPool::<Vec<u8>>::new_with_config(
+        AutoPoolConfig {
+            wait_duration: Duration::from_millis(1),
+            ..Default::default()
+        },
+        [],
+    );
+    c.bench_function("exhaustion/wait_1ms", |b| b.iter(|| assert!(black_box(pool.get()).is_none())));
+}
+
+#[cfg(feature = "async")]
+fn async_handoff(c: &mut Criterion) {
+    // Poll to Pending before asking the producer for an item. Measure from just
+    // before add() to consumer resumption, excluding the request-channel delay.
+    let pool = AutoPool::new([]);
+    let (request, requests) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        let pool = &pool;
+        let producer = scope.spawn(move || {
+            while requests.recv().is_ok() {
+                pool.add(Instant::now());
+            }
+        });
+        c.bench_function("async/handoff_from_thread", |b| {
+            b.iter_custom(|iterations| {
+                smol::block_on(async {
+                    let mut elapsed = Duration::ZERO;
+                    for _ in 0..iterations {
+                        let mut get = Box::pin(pool.get_async());
+                        assert!(smol::future::poll_once(&mut get).await.is_none());
+                        request.send(()).unwrap();
+                        let sent = get.await.unwrap().release();
+                        elapsed += sent.elapsed();
+                        black_box(sent);
+                    }
+                    elapsed
+                })
+            });
+        });
+        drop(request);
+        producer.join().unwrap();
+    });
+}
+
+fn benchmarks(c: &mut Criterion) {
+    uncontended(c);
+    contention(c);
+    exhaustion(c);
+    #[cfg(feature = "async")]
+    async_handoff(c);
+}
+
+criterion_group!(benches, benchmarks);
 criterion_main!(benches);
