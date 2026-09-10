@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4](https://github.com/Sild/libs-rs/compare/v0.3.3...v0.3.4) - 2026-09-10
+
+### Other
+
+- notify async waiters and enforce checkout deadlines ([#59](https://github.com/Sild/libs-rs/pull/59))
+
 ## [0.3.3](https://github.com/Sild/libs_rs/compare/v0.3.2...v0.3.3) - 2026-03-31
 
 ### Other
